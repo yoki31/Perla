@@ -1,16 +1,20 @@
 ﻿namespace Perla
 
 open System
+open System.IO
+open System.Threading.Tasks
 open FSharp.Control
 open FsToolkit.ErrorHandling
-
+open FSharp.Control.Reactive
+open Perla.Lib
 open Types
 open Server
 open Build
+open Logger
+open Spectre.Console
 
 open Argu
 
-open type Fs.Paths
 
 
 type ServerArgs =
@@ -43,16 +47,24 @@ type BuildArgs =
 type InitArgs =
   | [<AltCommandLine("-p")>] Path of string option
   | [<AltCommandLine("-wf")>] With_Fable of bool option
+  | [<AltCommandLine("-k")>] Init_Kind of InitKind option
+  | [<AltCommandLine("-y")>] Yes of bool option
+
 
   static member ToOptions(args: ParseResults<InitArgs>) : InitOptions =
     { path = args.TryGetResult(Path) |> Option.flatten
-      withFable = args.TryGetResult(With_Fable) |> Option.flatten }
+      withFable = args.TryGetResult(With_Fable) |> Option.flatten
+      initKind = args.TryGetResult(Init_Kind) |> Option.flatten
+      yes = args.TryGetResult(Yes) |> Option.flatten }
 
   interface IArgParserTemplate with
     member this.Usage: string =
       match this with
       | Path _ -> "Where to write the config file"
       | With_Fable _ -> "Includes fable options in the config file"
+      | Init_Kind _ ->
+        "Sets whether to do a full perla setup or just create a perla.json file."
+      | Yes _ -> "Skips the full init prompt"
 
 type SearchArgs =
   | [<AltCommandLine("-n")>] Name of string
@@ -123,6 +135,38 @@ type ListArgs =
       match this with
       | As_Package_Json -> "Lists packages in npm's package.json format."
 
+type RepositoryArgs =
+  | [<AltCommandLine("-n")>] Repository_Name of string
+  | [<AltCommandLine("-b")>] Branch of string option
+
+  static member ToOptions
+    (args: ParseResults<RepositoryArgs>)
+    : RepositoryOptions =
+    { fullRepositoryName = args.GetResult(Repository_Name)
+      branch =
+        args.GetResult(Branch)
+        |> Option.defaultValue "main" }
+
+  interface IArgParserTemplate with
+    member s.Usage =
+      match s with
+      | Repository_Name _ -> "Name of the repository where the template lives"
+      | Branch _ -> "Branch to pick the repository from, defaults to \"main\""
+
+type NewProjectArgs =
+  | [<AltCommandLine("-t")>] Template of string
+  | [<AltCommandLine("-n")>] ProjectName of string
+
+  static member ToOptions(args: ParseResults<NewProjectArgs>) : ProjectOptions =
+    { projectName = args.GetResult(ProjectName)
+      templateName = args.GetResult(Template) }
+
+  interface IArgParserTemplate with
+    member s.Usage =
+      match s with
+      | ProjectName _ -> "Name of the project to create."
+      | Template _ -> "Template to use for this project."
+
 type DevServerArgs =
   | [<CliPrefix(CliPrefix.None); AltCommandLine("s")>] Serve of
     ParseResults<ServerArgs>
@@ -133,8 +177,16 @@ type DevServerArgs =
     ParseResults<SearchArgs>
   | [<CliPrefix(CliPrefix.None)>] Show of ParseResults<ShowArgs>
   | [<CliPrefix(CliPrefix.None)>] Add of ParseResults<AddArgs>
+  | [<CliPrefix(CliPrefix.None)>] Restore
   | [<CliPrefix(CliPrefix.None)>] Remove of ParseResults<RemoveArgs>
   | [<CliPrefix(CliPrefix.None)>] List of ParseResults<ListArgs>
+  | [<CliPrefix(CliPrefix.None)>] New of ParseResults<NewProjectArgs>
+  | [<CliPrefix(CliPrefix.None)>] Add_Template of ParseResults<RepositoryArgs>
+  | [<CliPrefix(CliPrefix.None)>] Update_Template of
+    ParseResults<RepositoryArgs>
+  | [<CliPrefix(CliPrefix.None); AltCommandLine("-lt")>] List_Templates
+  | [<CliPrefix(CliPrefix.None); AltCommandLine("-rt")>] Remove_Template of
+    string
   | [<AltCommandLine("-v")>] Version
 
   interface IArgParserTemplate with
@@ -143,23 +195,50 @@ type DevServerArgs =
       | Serve _ ->
         "Starts a development server for modern Javascript development"
       | Build _ -> "Builds the specified JS and CSS resources for production"
-      | Init _ -> "Creates basic files and directories to start using fds."
+      | Init _ -> "Sets perla up to start new projects."
       | Search _ -> "Searches a package in the skypack API."
       | Show _ -> "Gets the skypack information about a package."
       | Add _ -> "Generates an entry in the import map."
+      | Restore _ -> "Restores import map"
       | Remove _ -> "Removes an entry in the import map."
       | List _ -> "Lists entries in the import map."
+      | New _ -> "Creates a new Perla based project."
+      | List_Templates -> "Shows existing templates available to scaffold."
+      | Add_Template _ ->
+        "Downloads a GitHub repository to the templates directory."
+      | Update_Template _ ->
+        "Downloads a new version of the specified template."
+      | Remove_Template _ -> "Removes an existing templating repository."
       | Version _ -> "Prints out the cli version to the console."
 
 module Commands =
+  let private (|ParseRegex|_|) regex str =
+    let m = Text.RegularExpressions.Regex(regex).Match(str)
+
+    if m.Success then
+      Some(List.tail [ for x in m.Groups -> x.Value ])
+    else
+      None
+
+  let parseUrl url =
+    match url with
+    | ParseRegex @"https://cdn.skypack.dev/pin/(@?[^@]+)@v([\d.]+)"
+                 [ name; version ] -> Some(Source.Skypack, name, version)
+    | ParseRegex @"https://cdn.jsdelivr.net/npm/(@?[^@]+)@([\d.]+)"
+                 [ name; version ] -> Some(Source.Jsdelivr, name, version)
+    | ParseRegex @"https://ga.jspm.io/npm:(@?[^@]+)@([\d.]+)" [ name; version ] ->
+      Some(Source.Jspm, name, version)
+    | ParseRegex @"https://unpkg.com/(@?[^@]+)@([\d.]+)" [ name; version ] ->
+      Some(Source.Unpkg, name, version)
+    | _ -> None
 
   let getServerOptions (serverargs: ServerArgs list) =
     let config =
-      match Fs.getPerlaConfig (Fs.Paths.GetPerlaConfigPath()) with
+      match Fs.getPerlaConfig (Path.GetPerlaConfigPath()) with
       | Ok config -> config
       | Error err ->
-        eprintfn "%s" err.Message
-        FdsConfig.DefaultConfig()
+        Logger.log ("Failed to get perla config, using defaults", err)
+        PerlaConfig.DefaultConfig()
 
     let devServerConfig =
       match config.devServer with
@@ -183,11 +262,11 @@ module Commands =
 
   let getBuildOptions (serverargs: BuildArgs list) =
     let config =
-      match Fs.getPerlaConfig (Fs.Paths.GetPerlaConfigPath()) with
+      match Fs.getPerlaConfig (Path.GetPerlaConfigPath()) with
       | Ok config -> config
       | Error err ->
-        eprintfn "%s" err.Message
-        FdsConfig.DefaultConfig()
+        Logger.log ("Failed to get perla config, using defaults", err)
+        PerlaConfig.DefaultConfig()
 
     let buildConfig =
       match config.build with
@@ -207,7 +286,7 @@ module Commands =
           |> List.fold foldBuildOptions buildConfig
           |> Some }
 
-  let startBuild (configuration: FdsConfig) = execBuild configuration
+  let startBuild (configuration: PerlaConfig) = execBuild configuration
 
 
   let private (|ScopedPackage|Package|) (package: string) =
@@ -250,28 +329,290 @@ module Commands =
       else
         name, None
 
-  let runInit options =
-    result {
+  let private getRepositoryName (fullRepoName: string) =
+    match
+      fullRepoName.Split("/")
+      |> Array.filter (String.IsNullOrWhiteSpace >> not)
+      with
+    | [| _; repoName |] -> Ok repoName
+    | [| _ |] -> Error MissingRepoName
+    | _ -> Error WrongGithubFormat
+
+  let private getTemplateAndChild (templateName: string) =
+    match
+      templateName.Split("/")
+      |> Array.filter (String.IsNullOrWhiteSpace >> not)
+      with
+    | [| user; template; child |] -> Some user, template, Some child
+    | [| template; child |] -> None, template, Some child
+    | [| template |] -> None, template, None
+    | _ -> None, templateName, None
+
+  let runListTemplates () =
+    let results = Database.listEntries ()
+
+    let table =
+      Table()
+        .AddColumn("Name")
+        .AddColumn("Templates")
+        .AddColumn("Template Branch")
+        .AddColumn("Last Update")
+        .AddColumn("Location")
+
+    for column in table.Columns do
+      column.Alignment <- Justify.Center
+
+    for result in results do
+      let printedDate =
+        result.updatedAt
+        |> Option.ofNullable
+        |> Option.defaultValue result.createdAt
+        |> (fun x -> x.ToShortDateString())
+
+      let children =
+        let names =
+          Fs.getPerlaRepositoryChildren result
+          |> Array.map (fun d -> $"[green]{d.Name}[/]")
+
+        String.Join("\n", names) |> Markup
+
       let path =
-        match options.path with
-        | Some path -> GetPerlaConfigPath(path)
-        | None -> GetPerlaConfigPath()
+        let path = TextPath(result.path)
+        path.LeafStyle <- Style(Color.Green)
+        path.StemStyle <- Style(Color.Yellow)
+        path.SeparatorStyle <- Style(Color.Blue)
+        path
 
-      let config = FdsConfig.DefaultConfig(defaultArg options.withFable false)
+      table.AddRow(
+        Markup($"[yellow]{result.fullName}[/]"),
+        children,
+        Markup(result.branch),
+        Markup(printedDate),
+        path
+      )
+      |> ignore
 
-      let fable =
-        config.fable
-        |> Option.map (fun fable -> { fable with autoStart = Some true })
+    AnsiConsole.Write table
 
-      let config =
-        {| ``$schema`` = config.``$schema``
-           index = config.index
-           fable = fable |}
+    0
 
-      do! Fs.createPerlaConfig path config
+  let runAddTemplate (autoContinue: bool option) (opts: RepositoryOptions) =
+    taskResult {
+      match getRepositoryName opts.fullRepositoryName with
+      | Error err ->
+        return!
+          err.AsString
+          |> FailedToParseNameException
+          |> Error
+      | Ok simpleName ->
+        if Database.existsByFullName opts.fullRepositoryName then
+          match autoContinue with
+          | Some true ->
+            let updateOperation =
+              taskOption {
+                let! repo = Database.findByFullName opts.fullRepositoryName
+                let repo = { repo with branch = opts.branch }
 
-      return 0
+                let! repo =
+                  repo
+                  |> Scaffolding.downloadRepo
+                  |> Scaffolding.unzipAndClean
+
+                return! Database.updateEntry (Some repo)
+              }
+
+            match! updateOperation with
+            | Some true ->
+              Logger.log
+                $"{opts.fullRepositoryName} - {opts.branch} updated correctly"
+
+              return 0
+            | _ -> return 0
+          | _ ->
+            let prompt =
+              SelectionPrompt<string>()
+                .AddChoices([ "Yes"; "No" ])
+
+            prompt.Title <-
+              $"\"{opts.fullRepositoryName}\" already exists, Do you want to update it?"
+
+            match AnsiConsole.Prompt(prompt) with
+            | "Yes" ->
+              let updateOperation =
+                Logger.spinner (
+                  "Updating Templates",
+                  fun context ->
+                    taskOption {
+                      let! repo =
+                        Database.findByFullName opts.fullRepositoryName
+
+                      let repo = { repo with branch = opts.branch }
+
+                      let! repo =
+                        repo
+                        |> (fun repository ->
+                          context.Status <- "Downloading Templates"
+
+                          repository)
+                        |> Scaffolding.downloadRepo
+                        |> (fun tsk ->
+                          context.Status <- "Extracting Templates"
+                          tsk)
+                        |> Scaffolding.unzipAndClean
+
+                      return! Database.updateEntry (Some repo)
+                    }
+                )
+
+              match! updateOperation with
+              | Some true ->
+                Logger.log
+                  $"{opts.fullRepositoryName} - {opts.branch} updated correctly"
+
+                return 0
+              | _ -> return! UpdateTemplateFailedException |> Error
+            | _ -> return 0
+        else
+          let path =
+            Fs.getPerlaRepositoryPath opts.fullRepositoryName opts.branch
+
+          let addedRepository =
+            Logger.spinner (
+              "Adding new templates",
+              fun context ->
+                taskOption {
+                  let! addedRepository =
+                    (simpleName, opts.fullRepositoryName, opts.branch)
+                    |> (PerlaTemplateRepository.NewClamRepo path)
+                    |> (fun tsk ->
+                      context.Status <- "Downloading Templates"
+                      tsk)
+                    |> Scaffolding.downloadRepo
+                    |> (fun tsk ->
+                      context.Status <- "Extracting Templates"
+                      tsk)
+                    |> Scaffolding.unzipAndClean
+
+                  return! Database.createEntry (Some addedRepository)
+                }
+            )
+
+          match! addedRepository with
+          | Some repository ->
+            Logger.log
+              $"Succesfully added {repository.fullName} at {repository.path}"
+
+            return 0
+          | None -> return! AddTemplateFailedException |> Error
     }
+
+
+  let runInit (options: InitOptions) =
+    taskResult {
+      let path = Path.GetPerlaConfigPath(?directoryPath = options.path)
+
+      let initKind = defaultArg options.initKind InitKind.Full
+
+      match initKind with
+      | InitKind.Full ->
+        Logger.log "Perla will set up the following resources:"
+        Logger.log "- Esbuild"
+        Logger.log "- Default Templates"
+
+        Logger.log
+          "After that you should be able to run 'perla build' or 'perla new'"
+
+        let canContinue =
+          match options.yes with
+          | Some true -> true
+          | _ ->
+            let prompt =
+              SelectionPrompt<string>()
+                .AddChoices([ "Yes"; "No" ])
+
+            prompt.Title <- $"Can we Start?"
+
+            match AnsiConsole.Prompt(prompt) with
+            | "Yes" -> true
+            | _ -> false
+
+        if not <| canContinue then
+          Logger.log "Nothing to do, finishing here"
+          return 0
+        else
+          do! Esbuild.setupEsbuild Constants.Esbuild_Version
+
+          let! res =
+            runAddTemplate
+              (Some true)
+              { branch = Constants.Default_Templates_Repository_Branch
+                fullRepositoryName = Constants.Default_Templates_Repository }
+
+          if res <> 0 then
+            return res
+          else
+            Logger.log (
+              "[bold green]esbuild[/] and [bold yellow]templates[/] have been setup!",
+              escape = false
+            )
+
+            runListTemplates () |> ignore
+            Logger.log "Feel free to create a new perla project"
+
+            Logger.log (
+              "[bold yellow]perla[/] [bold blue]new -t[/] [bold green]perla-samples/<TEMPLATE_NAME>[/] [bold blue]-n <PROJECT_NAME>[/]",
+              escape = false
+            )
+
+            return 0
+      | InitKind.Simple ->
+        let config =
+          PerlaConfig.DefaultConfig(defaultArg options.withFable false)
+
+        let fable =
+          config.fable
+          |> Option.map (fun fable -> { fable with autoStart = Some true })
+
+        let config =
+          {| ``$schema`` = config.``$schema``
+             index = config.index
+             fable = fable |}
+
+        do! Fs.createPerlaConfig path config
+
+        return 0
+      | _ ->
+        return!
+          (ArgumentException "The provided kind is not supported" :> exn)
+          |> Error
+    }
+
+  let private printSearchTable (searchData: SkypackSearchResult seq) =
+    let table =
+      Table()
+        .AddColumn(TableColumn("Name"))
+        .AddColumn(TableColumn("Description"))
+        .AddColumn(TableColumn("Maintainers"))
+        .AddColumn(TableColumn("Last Updated"))
+
+    for row in searchData do
+      let maintainers =
+        row.maintainers
+        |> Seq.truncate 3
+        |> Seq.map (fun maintainer ->
+          $"[yellow]{maintainer.name}[/] - [yellow]{maintainer.email}[/]")
+
+      let maintainers = String.Join("\n", maintainers)
+
+      table.AddRow(
+        Markup($"[bold green]{row.name}[/]"),
+        Markup(row.description),
+        Markup(maintainers),
+        Markup(row.updatedAt.ToShortDateString())
+      )
+      |> ignore
+
+    AnsiConsole.Write table
 
   let runSearch (options: SearchOptions) =
     taskResult {
@@ -280,31 +621,82 @@ module Commands =
         | Some package -> Ok package
         | None -> Error PackageNotFoundException
 
-      let! results = Http.searchPackage package options.page
+      let! results =
+        Logger.spinner (
+          "Searching for package information",
+          Http.searchPackage package options.page
+        )
 
       results.results
       |> Seq.truncate 5
-      |> Seq.iter (fun package ->
-        let maintainers =
-          package.maintainers
-          |> Seq.fold
-               (fun curr next -> $"{curr}{next.name} - {next.email}\n\t")
-               "\n\t"
+      |> printSearchTable
 
-        printfn "%s" ("".PadRight(10, '-'))
+      Logger.log (
+        $"[bold green]Found[/]: {results.meta.totalCount}",
+        escape = false
+      )
 
-        printfn
-          $"""name: {package.name}
-Description: {package.description}
-Maintainers:{maintainers}
-Updated: {package.updatedAt.ToShortDateString()}"""
+      Logger.log (
+        $"[bold green]Page[/] {results.meta.page} of {results.meta.totalPages}",
+        escape = false
+      )
 
-        printfn "%s" ("".PadRight(10, '-')))
-
-      printfn $"Found: {results.meta.totalCount}"
-      printfn $"Page {results.meta.page} of {results.meta.totalPages}"
       return 0
     }
+
+  let private printShowTable (package: ShowSearchResults) =
+    let table =
+      Table()
+        .AddColumn(TableColumn("Description"))
+        .AddColumn(TableColumn("Is Deprecated"))
+        .AddColumn(TableColumn("Dependency Count"))
+        .AddColumn(TableColumn("License"))
+        .AddColumn(TableColumn("Versions"))
+        .AddColumn(TableColumn("Maintainers"))
+        .AddColumn(TableColumn("Last Update"))
+
+    let maintainers =
+      package.maintainers
+      |> Seq.truncate 5
+      |> Seq.map (fun maintainer ->
+        $"[yellow]{maintainer.name}[/] - [yellow]{maintainer.email}[/]")
+
+    let maintainers = String.Join("\n", maintainers)
+
+    let versions =
+      package.distTags
+      |> Map.toSeq
+      |> Seq.truncate 5
+      |> Seq.map (fun (name, version) ->
+        $"[bold yellow]{name}[/] - [dim green]{version}[/]")
+
+    let versions = String.Join("\n", versions)
+
+    let deprecated =
+      if package.isDeprecated then
+        "[bold red]Yes[/]"
+      else
+        "[green]No[/]"
+
+    let sep =
+      Rule($"[bold green]{package.name}[/]")
+        .Centered()
+        .RuleStyle("bold green")
+
+    AnsiConsole.Write sep
+
+    table.AddRow(
+      Markup(package.description),
+      Markup(deprecated),
+      Markup($"[bold green]%i{package.dependenciesCount}[/]"),
+      Markup($"[bold yellow]{package.license}[/]"),
+      Markup(versions),
+      Markup(maintainers),
+      Markup(package.updatedAt.ToShortDateString())
+    )
+    |> ignore
+
+    AnsiConsole.Write table
 
   let runShow (options: ShowPackageOptions) =
     taskResult {
@@ -313,78 +705,47 @@ Updated: {package.updatedAt.ToShortDateString()}"""
         | Some package -> Ok package
         | None -> Error PackageNotFoundException
 
-      let! package = Http.showPackage package
+      let! package =
+        Logger.spinner (
+          "Searching for package information",
+          Http.showPackage package
+        )
 
-      let maintainers =
-        package.maintainers
-        |> Seq.rev
-        |> Seq.truncate 5
-        |> Seq.fold
-             (fun curr next -> $"{curr}{next.name} - {next.email}\n\t")
-             "\n\t"
-
-      let versions =
-        package.distTags
-        |> Map.toSeq
-        |> Seq.truncate 5
-        |> Seq.fold
-             (fun curr (name, version) -> $"{curr}{name} - {version}\n\t")
-             "\n\t"
-
-      printfn "%s" ("".PadRight(10, '-'))
-
-      printfn
-        $"""name: {package.name}
-Description: {package.description}
-Deprecated: %b{package.isDeprecated}
-Dependency Count: {package.dependenciesCount}
-License: {package.license}
-Versions: {versions}
-Maintainers:{maintainers}
-Updated: {package.updatedAt.ToShortDateString()}"""
-
-      printfn "%s" ("".PadRight(10, '-'))
+      printShowTable package
       return 0
     }
 
   let runList (options: ListPackagesOptions) =
-    let (|ParseRegex|_|) regex str =
-      let m = Text.RegularExpressions.Regex(regex).Match(str)
-
-      if m.Success then
-        Some(List.tail [ for x in m.Groups -> x.Value ])
-      else
-        None
-
     taskResult {
-      let parseUrl url =
-        match url with
-        | ParseRegex @"https://cdn.skypack.dev/pin/(@?[^@]+)@v([\d.]+)"
-                     [ name; version ]
-        | ParseRegex @"https://cdn.jsdelivr.net/npm/(@?[^@]+)@([\d.]+)"
-                     [ name; version ]
-        | ParseRegex @"https://ga.jspm.io/npm:(@?[^@]+)@([\d.]+)"
-                     [ name; version ]
-        | ParseRegex @"https://unpkg.com/(@?[^@]+)@([\d.]+)" [ name; version ] ->
-          Some(name, version)
-        | _ -> None
+      let! config = Fs.getPerlaConfig (Path.GetPerlaConfigPath())
 
-      let! config = Fs.getPerlaConfig (GetPerlaConfigPath())
       let installedPackages = config.packages |> Option.defaultValue Map.empty
 
       match options.format with
       | HumanReadable ->
-        printfn "Installed packages (alias: packageName@version)"
-        printfn ""
+        Logger.log (
+          "[bold green]Installed packages[/] [yellow](alias: packageName@version)[/]\n",
+          escape = false
+        )
 
         for importMap in installedPackages do
           match parseUrl importMap.Value with
-          | Some (name, version) -> printfn $"{importMap.Key}: {name}@{version}"
-          | None -> printfn $"{importMap.Key}: Couldn't parse {importMap.Value}"
+          | Some (_, name, version) ->
+            Logger.log (
+              $"[bold yellow]{importMap.Key}[/]: [green]{name}@{version}[/]",
+              escape = false
+            )
+          | None ->
+            Logger.log (
+              $"[bold red]{importMap.Key}[/]: [yellow]Couldn't parse {importMap.Value}[/]",
+              escape = false
+            )
       | PackageJson ->
         installedPackages
         |> Map.toList
-        |> List.choose (fun (_alias, importMap) -> parseUrl importMap)
+        |> List.choose (fun (_alias, importMap) ->
+          parseUrl importMap
+          |> Option.map (fun (_, name, version) -> (name, version)))
         |> Map.ofList
         |> Json.ToPackageJson
         |> printfn "%s"
@@ -395,12 +756,13 @@ Updated: {package.updatedAt.ToShortDateString()}"""
   let runRemove (options: RemovePackageOptions) =
     taskResult {
       let name = defaultArg options.package ""
+      Logger.log ($"Removing: [red]{name}[/]", escape = false)
 
       if name = "" then
         return! PackageNotFoundException |> Error
 
-      let! fdsConfig = Fs.getPerlaConfig (GetPerlaConfigPath())
-      let! lockFile = Fs.getOrCreateLockFile (GetPerlaConfigPath())
+      let! fdsConfig = Fs.getPerlaConfig (Path.GetPerlaConfigPath())
+      let! lockFile = Fs.getOrCreateLockFile (Path.GetPerlaConfigPath())
 
       let deps =
         fdsConfig.packages
@@ -414,16 +776,111 @@ Updated: {package.updatedAt.ToShortDateString()}"""
         lockFile.scopes
         |> Map.map (fun _ value -> value |> Map.remove name)
 
+      Logger.log ("Updating importmap...")
+      Logger.log ($"Writing scopes: %A{scopes}")
+      Logger.log ($"Writing imports: %A{imports}")
+
       do!
         Fs.writeLockFile
-          (GetPerlaConfigPath())
+          (Path.GetPerlaConfigPath())
           { lockFile with
               scopes = scopes
               imports = imports }
 
-      do! Fs.createPerlaConfig (GetPerlaConfigPath()) opts
+      do! Fs.createPerlaConfig (Path.GetPerlaConfigPath()) opts
 
       return 0
+    }
+
+  let runNew (opts: ProjectOptions) =
+    Logger.log ("Creating new project...")
+    let (user, template, child) = getTemplateAndChild opts.templateName
+
+    result {
+      let repository =
+        match user, child with
+        | Some user, Some _ -> Database.findByFullName $"{user}/{template}"
+        | Some _, None -> Database.findByFullName opts.templateName
+        | None, _ -> Database.findByName template
+
+      match repository with
+      | Some clamRepo ->
+        Logger.log (
+          $"Using [bold yellow]{clamRepo.name}:{clamRepo.branch}[/]",
+          escape = false
+        )
+
+        let templatePath = Fs.getPerlaTemplatePath clamRepo child
+        let targetPath = Fs.getPerlaTemplateTarget opts.projectName
+
+        let content =
+          Fs.getPerlaTemplateScriptContent templatePath clamRepo.path
+
+        Logger.log ($"Creating structure...")
+
+        match content with
+        | Some content ->
+          Extensibility.getConfigurationFromScript content
+          |> Scaffolding.compileAndCopy templatePath targetPath
+        | None -> Scaffolding.compileAndCopy templatePath targetPath None
+
+        return 0
+      | None ->
+        return!
+          TemplateNotFoundException
+            $"Template [{opts.templateName}] was not found"
+          |> Error
+    }
+
+  let runRemoveTemplate (name: string) =
+    let deleteOperation =
+      option {
+        let! repo = Database.findByFullName name
+        Fs.removePerlaRepository repo
+        return! Database.deleteByFullName repo.fullName
+      }
+
+    match deleteOperation with
+    | Some true ->
+      Logger.log (
+        $"[bold yellow]{name}[/] deleted from repositories.",
+        escape = false
+      )
+
+      Ok 0
+    | Some false ->
+      Logger.log (
+        $"[bold red]{name}[/] could not be deleted from repositories.",
+        escape = false
+      )
+
+      DeleteTemplateFailedException |> Error
+    | None -> name |> TemplateNotFoundException |> Error
+
+  let runUpdateTemplate (opts: RepositoryOptions) =
+    taskResult {
+      let updateOperation =
+        taskOption {
+          let! repo = Database.findByFullName opts.fullRepositoryName
+          let repo = { repo with branch = opts.branch }
+
+          let! repo =
+            repo
+            |> Scaffolding.downloadRepo
+            |> Scaffolding.unzipAndClean
+
+          return! Database.updateEntry (Some repo)
+        }
+
+      match! updateOperation with
+      | Some true ->
+        Logger.log (
+          $"[bold green]{opts.fullRepositoryName}[/] - [yellow]{opts.branch}[/] updated correctly",
+          escape = false
+        )
+
+        return 0
+      | _ -> return! UpdateTemplateFailedException |> Error
     }
 
   let runAdd (options: AddPackageOptions) =
@@ -442,11 +899,15 @@ Updated: {package.updatedAt.ToShortDateString()}"""
         | Some version -> $"@{version}"
         | None -> ""
 
-      let! (deps, scopes) =
-        Http.getPackageUrlInfo $"{package}{version}" alias source
+      let! deps, scopes =
+        Logger.spinner (
+          $"Adding: [bold yellow]{package}{version}[/]",
+          Http.getPackageUrlInfo $"{package}{version}" alias source
+        )
 
-      let! fdsConfig = Fs.getPerlaConfig (GetPerlaConfigPath())
-      let! lockFile = Fs.getOrCreateLockFile (GetPerlaConfigPath())
+
+      let! fdsConfig = Fs.getPerlaConfig (Path.GetPerlaConfigPath())
+      let! lockFile = Fs.getOrCreateLockFile (Path.GetPerlaConfigPath())
 
       let packages =
         fdsConfig.packages
@@ -464,16 +925,68 @@ Updated: {package.updatedAt.ToShortDateString()}"""
           |> fun existing -> existing @ deps |> Map.ofList
 
         let scopes =
+          let scopes = scopes |> Map.ofList
+
           lockFile.scopes
-          |> Map.toList
-          |> fun existing -> existing @ scopes |> Map.ofList
+          |> Map.fold
+               (fun acc key value ->
+                 match acc |> Map.tryFind key with
+                 | Some found ->
+                   let newValue =
+                     (found |> Map.toList) @ (value |> Map.toList)
+                     |> Map.ofList
+
+                   acc |> Map.add key newValue
+                 | None -> acc |> Map.add key value)
+               scopes
+
+        Logger.log ("Updating importmap...")
+        Logger.log ($"Writing scopes: %A{scopes}")
+        Logger.log ($"Writing imports: %A{imports}")
 
         { lockFile with
             imports = imports
             scopes = scopes }
 
-      do! Fs.createPerlaConfig (GetPerlaConfigPath()) fdsConfig
-      do! Fs.writeLockFile (GetPerlaConfigPath()) lockFile
+      do! Fs.createPerlaConfig (Path.GetPerlaConfigPath()) fdsConfig
+      do! Fs.writeLockFile (Path.GetPerlaConfigPath()) lockFile
+
+      return 0
+    }
+
+  let runRestore () =
+    taskResult {
+      let! fdsConfig = Fs.getPerlaConfig (Path.GetPerlaConfigPath())
+      let! lockFile = Fs.getOrCreateLockFile (Path.GetPerlaConfigPath())
+
+      if lockFile.imports |> Map.isEmpty |> not then
+        return! exn "Import map already exists" |> Error
+
+      let packages =
+        fdsConfig.packages
+        |> Option.defaultValue Map.empty
+
+      let addRuns =
+        packages
+        |> Map.toList
+        |> List.map (fun (k, v) ->
+          match parseUrl v with
+          | None -> raise (FormatException "Packages has incorrect format")
+          | Some (source, name, version) ->
+            let alias = if k = name then None else Some k
+
+            let options: AddPackageOptions =
+              { AddPackageOptions.package = Some $"{name}@{version}"
+                alias = alias
+                source = Some source }
+
+            runAdd options)
+
+      Logger.log "Regenerating import map..."
+
+      do!
+        List.sequenceTaskResultM addRuns
+        |> TaskResult.ignore
 
       return 0
     }
@@ -538,8 +1051,10 @@ Updated: {package.updatedAt.ToShortDateString()}"""
         return! async { return () }
     }
 
-  let startInteractive (configuration: FdsConfig) =
+  let startInteractive (configuration: unit -> PerlaConfig) =
     let onStdinAsync = serverActions tryExecPerlaCommand configuration
+    let perlaWatcher = Fs.getPerlaConfigWatcher ()
+    let configuration = configuration ()
 
     let devServer =
       defaultArg configuration.devServer (DevServerConfig.DefaultConfig())
@@ -561,9 +1076,18 @@ Updated: {package.updatedAt.ToShortDateString()}"""
     |> Async.StartImmediate
 
     Console.CancelKeyPress.Add (fun _ ->
-      printfn "Got it, see you around!..."
+      Logger.log "Got it, see you around!..."
       onStdinAsync "exit" |> Async.RunSynchronously
       exit 0)
+
+    [ perlaWatcher.Changed
+      |> Observable.throttle (TimeSpan.FromMilliseconds(400.))
+      perlaWatcher.Created
+      |> Observable.throttle (TimeSpan.FromMilliseconds(400.)) ]
+    |> Observable.mergeSeq
+    |> Observable.map (fun _ -> onStdinAsync "restart")
+    |> Observable.switchAsync
+    |> Observable.add (fun _ -> Logger.log "perla.jsonc Changed, Restarting")
 
     asyncSeq {
       if autoStartServer then "start"

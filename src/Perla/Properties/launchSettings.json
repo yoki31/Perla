@@ -3,7 +3,37 @@
     "Serve App": {
       "commandName": "Project",
       "commandLineArgs": "serve",
-      "workingDirectory": "..\\App"
+      "workingDirectory": "$(ProjectDir)/../App"
+    },
+    "Serve Docs": {
+      "commandName": "Project",
+      "commandLineArgs": "serve",
+      "workingDirectory": "$(ProjectDir)/../docs"
+    },
+    "Build Docs": {
+      "commandName": "Project",
+      "commandLineArgs": "build",
+      "workingDirectory": "$(ProjectDir)/../docs"
+    },
+    "Add Template": {
+      "commandName": "Project",
+      "commandLineArgs": "add-template -n AngelMunoz/perla-samples -b clam-poc",
+      "workingDirectory": "$(ProjectDir)/../App"
+    },
+    "Create Project": {
+      "commandName": "Project",
+      "commandLineArgs": "new -t perla-samples/lit-js -n clam-poc",
+      "workingDirectory": "$(ProjectDir)/../App"
+    },
+    "Add Lit JSPM ": {
+      "commandName": "Project",
+      "commandLineArgs": "add -p lit -s jspm",
+      "workingDirectory": "$(ProjectDir)/../App"
+    },
+    "Add RxJS JSPM ": {
+      "commandName": "Project",
+      "commandLineArgs": "add -p rxjs -s jspm",
+      "workingDirectory": "$(ProjectDir)/../App"
     }
   }
 }

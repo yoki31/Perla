@@ -1,11 +1,11 @@
 ﻿#!/usr/bin/env -S dotnet fsi
-#r "nuget: Fake.DotNet.Cli, 5.20.4"
-#r "nuget: Fake.IO.FileSystem, 5.20.4"
-#r "nuget: Fake.Core.Target, 5.20.4"
-#r "nuget: Fake.DotNet.MsBuild, 5.20.4"
-#r "nuget: MSBuild.StructuredLogger, 2.1.507"
+#r "nuget: Fake.DotNet.Cli, 5.22.0"
+#r "nuget: Fake.IO.FileSystem, 5.22.0"
+#r "nuget: Fake.Core.Target, 5.22.0"
+#r "nuget: Fake.DotNet.MsBuild, 5.22.0"
+#r "nuget: MSBuild.StructuredLogger, 2.1.630"
 #r "nuget: System.IO.Compression.ZipFile, 4.3.0"
-#r "nuget: System.Reactive"
+#r "nuget: System.Reactive, 5.0.0"
 
 open System
 open System.IO.Compression
@@ -28,11 +28,46 @@ let output = "./dist"
 let runtimes =
     [| "linux-x64"
        "linux-arm64"
+       "osx-x64"
+       "osx-arm64"
        "win10-x64"
-       "osx-x64" |]
+       "win10-arm64" |]
+
+let fsharpSourceFiles =
+    !! "src/**/*.fs"
+    ++ "src/**/*.fsi"
+    ++ "src/**/*.fsx"
+    ++ "build.fsx"
+    -- "**/obj/**/*.fs"
+    -- "**/fable_modules/**/*.fs"
 
 Target.initEnvironment ()
 Target.create "Clean" (fun _ -> !! "dist" |> Shell.cleanDirs)
+
+Target.create "Format" (fun _ ->
+    let result =
+        fsharpSourceFiles
+        |> Seq.map (sprintf "\"%s\"")
+        |> String.concat " "
+        |> DotNet.exec id "fantomas"
+
+    if not result.OK then
+        printfn $"Errors while formatting all files: %A{result.Messages}")
+
+Target.create "CheckFormat" (fun _ ->
+    let result =
+        fsharpSourceFiles
+        |> Seq.map (sprintf "\"%s\"")
+        |> String.concat " "
+        |> sprintf "%s --check"
+        |> DotNet.exec id "fantomas"
+
+    if result.ExitCode = 0 then
+        Trace.log "No files need formatting"
+    elif result.ExitCode = 99 then
+        failwith "Some files need formatting, check output for more info"
+    else
+        Trace.logf $"Errors while formatting: %A{result.Errors}")
 
 Target.create "PackNugets" (fun _ ->
     DotNet.pack
@@ -65,7 +100,16 @@ Target.create "Zip" (fun _ ->
 
 Target.create "Default" (fun _ -> Target.runSimple "Zip" [] |> ignore)
 
+Target.create "SimpleBuild" (fun _ ->
+    DotNet.build
+        (fun opts ->
+            { opts with
+                Configuration = DotNet.BuildConfiguration.Release
+                Framework = Some "net6.0" })
+        "src/Perla/Perla.fsproj")
+
 "Clean"
+==> "CheckFormat"
 ==> "BuildBinaries"
 ==> "PackNugets"
 ==> "Default"

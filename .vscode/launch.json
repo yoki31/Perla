@@ -15,20 +15,37 @@
             ],
             "cwd": "${workspaceFolder}/src/App",
             "stopAtEntry": false,
-            "console": "internalConsole"
+            "console": "integratedTerminal"
         },
         {
-            "name": "Perla init",
+            "name": "Perla init simple",
             "type": "coreclr",
             "request": "launch",
             "preLaunchTask": "build",
             "program": "${workspaceFolder}/src/Perla/bin/Debug/net6.0/Perla.dll",
             "args": [
-                "init"
+                "init",
+                "-k",
+                "simple"
             ],
             "cwd": "${workspaceFolder}",
             "stopAtEntry": false,
-            "console": "internalConsole"
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Perla init full",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/src/Perla/bin/Debug/net6.0/Perla.dll",
+            "args": [
+                "init",
+                "-k",
+                "full"
+            ],
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": false,
+            "console": "integratedTerminal"
         },
         {
             "name": "Perla serve tsx",
@@ -41,7 +58,7 @@
             ],
             "cwd": "${workspaceFolder}/src/docs",
             "stopAtEntry": false,
-            "console": "internalConsole"
+            "console": "integratedTerminal"
         },
         {
             "name": "Perla add @shoelace-style/shoelace",
@@ -58,7 +75,7 @@
             ],
             "cwd": "${workspaceFolder}/src/App",
             "stopAtEntry": false,
-            "console": "internalConsole"
+            "console": "integratedTerminal"
         },
         {
             "name": "NET6 build",

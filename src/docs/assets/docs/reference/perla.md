@@ -2,11 +2,11 @@
 [json schema]: https://github.com/AngelMunoz/Perla/blob/main/perla.schema.json
 [json schemas]: https://json-schema.org/
 
-## perla.jsonc and perla.jsonc.lock
+## perla.jsonc and perla.jsonc.importmap
 
 The `perla.jsonc` file es the main configuration file with this file you an control most of the Perla CLI.
 
-The `perla.jsonc.lock` is the actual [import map] used by your application in both development and production
+The `perla.jsonc.importmap` is the actual [import map] used by your application in both development and production
 You can write comments on this file to keep tabs on why are things the way they are.
 
 We offer a [JSON schema] for the `perla.jsonc` file so you can get autocompletition in editors like VSCode and any other that supports [JSON Schemas]
@@ -38,7 +38,9 @@ A full `perla.jsonc` file looks like this:
       // e.g. ./src/index.js -> /src/index.js
       "./src": "/src",
       // e.g. ./assets/docs/index.md -> /assers/docs/indexmd
-      "./assets": "/assets"
+      "./assets": "/assets",
+      // e.g. anything under ./root-files will be available at "/" in the dev server
+      "./root-files": ""
     },
     // modify watch behavior
     "watchConfig": {
@@ -92,7 +94,14 @@ A full `perla.jsonc` file looks like this:
       ],
       // ensure a particular resource is copied even if it's
       // under a non-copy'able location
-      "includes": ["./src/sample.png"]
+      "includes": [
+        "./src/sample.png",
+        // when building you can re-target where your sources
+        // can be copied at, this together with mount directories
+        // can give you a flexible way to mount/copy non-standard files
+        // or files that need to have a specific address/location
+        "./root-files/manifest.webmanifest -> ./manifest.webmanifest"
+      ]
     },
     // ensure esbuild ignores a particular dependency
     "externals": ["my-undeclared-dependency", "@undeclared/dep"],

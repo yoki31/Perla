@@ -1,13 +1,11 @@
-﻿namespace Perla
+﻿namespace Perla.Lib
 
 open System
 open System.Text.Json
 open System.Text.Json.Serialization
 
+open LiteDB
 
-module Constants =
-  [<Literal>]
-  let Esbuild_Version = "0.13.2"
 
 module Types =
 
@@ -29,10 +27,44 @@ module Types =
     | "stop" -> Exit
     | value -> Unknown value
 
+  let (|Typescript|Javascript|Jsx|Css|Json|Other|) value =
+    match value with
+    | ".ts"
+    | ".tsx" -> Typescript
+    | ".js" -> Javascript
+    | ".jsx" -> Jsx
+    | ".json" -> Json
+    | ".css" -> Css
+    | _ -> Other value
+
+  [<RequireQualifiedAccess>]
   type LoaderType =
     | Typescript
     | Tsx
     | Jsx
+
+  [<RequireQualifiedAccess>]
+  type ReloadKind =
+    | FullReload
+    | HMR
+
+  [<RequireQualifiedAccess>]
+  type PerlaScript =
+    | LiveReload
+    | Worker
+
+  [<RequireQualifiedAccess>]
+  type ReloadEvents =
+    | FullReload of string
+    | ReplaceCSS of string
+    | CompileError of string
+
+    member this.AsString =
+      match this with
+      | FullReload data -> $"event:reload\ndata:{data}\n\n"
+      | ReplaceCSS data -> $"event:replace-css\ndata:{data}\n\n"
+      | CompileError err -> $"event:compile-err\ndata:{err}\n\n"
+
 
   type FableConfig =
     { autoStart: bool option
@@ -60,7 +92,12 @@ module Types =
             "*.json" ]
           |> List.toSeq
           |> Some
-        directories = [ "./src" ] |> List.toSeq |> Some }
+        directories =
+          seq {
+            "index.html"
+            "./src"
+          }
+          |> Some }
 
   type DevServerConfig =
     { autoStart: bool option
@@ -143,7 +180,7 @@ module Types =
         externals = None
         fileLoaders = BuildConfig.DefaultFileLoaders() |> Some }
 
-  type FdsConfig =
+  type PerlaConfig =
     { ``$schema``: string option
       index: string option
       fable: FableConfig option
@@ -166,7 +203,6 @@ module Types =
         build = BuildConfig.DefaultConfig() |> Some
         packages = None }
 
-
   type Scope = Map<string, string>
 
   type ImportMap =
@@ -181,6 +217,10 @@ module Types =
     | Jsdelivr = 2
     | Unpkg = 3
 
+  type InitKind =
+    | Full = 0
+    | Simple = 1
+
   type SkypackSearchResult =
     { createdAt: DateTime
       description: string
@@ -190,6 +230,19 @@ module Types =
       name: string
       popularityScore: float
       updatedAt: DateTime }
+
+  type ShowSearchResults =
+    { name: string
+      versions: Map<string, DateTime>
+      distTags: Map<string, string>
+      maintainers: {| name: string; email: string |} seq
+      license: string
+      updatedAt: DateTime
+      registry: string
+      description: string
+      isDeprecated: bool
+      dependenciesCount: int
+      links: Map<string, string> seq }
 
   type PackageCheck =
     { title: string
@@ -235,7 +288,9 @@ module Types =
 
   type InitOptions =
     { path: string option
-      withFable: bool option }
+      withFable: bool option
+      initKind: InitKind option
+      yes: bool option }
 
   type SearchOptions =
     { package: string option
@@ -256,9 +311,54 @@ module Types =
 
   type ListPackagesOptions = { format: ListFormat }
 
+  [<CLIMutable>]
+  type PerlaTemplateRepository =
+    { _id: ObjectId
+      name: string
+      fullName: string
+      branch: string
+      path: string
+      createdAt: DateTime
+      updatedAt: Nullable<DateTime> }
+
+    static member NewClamRepo
+      (path: string)
+      (name: string, fullName: string, branch: string)
+      =
+      { _id = ObjectId.NewObjectId()
+        name = name
+        fullName = fullName
+        branch = branch
+        path = path
+        createdAt = DateTime.Now
+        updatedAt = Nullable() }
+
+  type NameParsingErrors =
+    | MissingRepoName
+    | WrongGithubFormat
+
+    member this.AsString =
+      match this with
+      | MissingRepoName -> "The repository name is missing"
+      | WrongGithubFormat -> "The repository name is not a valid github name"
+
+  type RepositoryOptions =
+    { fullRepositoryName: string
+      branch: string }
+
+  type ProjectOptions =
+    { projectName: string
+      templateName: string }
+
+
   exception CommandNotParsedException of string
   exception HelpRequestedException
   exception MissingPackageNameException
   exception MissingImportMapPathException
   exception PackageNotFoundException
   exception HeaderNotFoundException of string
+  exception TemplateNotFoundException of string
+  exception FailedToParseNameException of string
+  exception AddTemplateFailedException
+  exception UpdateTemplateFailedException
+  exception DeleteTemplateFailedException

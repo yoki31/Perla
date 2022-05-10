@@ -1,4 +1,4 @@
-﻿namespace Perla
+﻿namespace Perla.Lib
 
 open System
 open System.IO
@@ -11,6 +11,7 @@ open AngleSharp.Html.Parser
 open Types
 open Fable
 open Esbuild
+open Logger
 
 module Build =
 
@@ -24,7 +25,7 @@ module Build =
       | JS -> "JS"
       | CSS -> "CSS"
 
-  let private getEntryPoints (type': ResourceType) (config: FdsConfig) =
+  let private getEntryPoints (type': ResourceType) (config: PerlaConfig) =
     let context = BrowsingContext.New(Configuration.Default)
 
     let indexFile = defaultArg config.index "index.html"
@@ -75,7 +76,12 @@ module Build =
 
     let styles =
       [ for (file: string) in cssFiles do
-          let file = if file.EndsWith("x") then file.Substring(0, file.Length - 1) else file
+          let file =
+            if file.EndsWith("x") then
+              file.Substring(0, file.Length - 1)
+            else
+              file
+
           let style = doc.CreateElement("link")
           style.SetAttribute("rel", "stylesheet")
           style.SetAttribute("href", file)
@@ -85,15 +91,20 @@ module Build =
     script.SetAttribute("type", "importmap")
 
     doc.Body.QuerySelectorAll("[data-entry-point][type=module]")
-    |> Seq.iter(fun el ->
+    |> Seq.iter (fun el ->
       match el.GetAttribute("src") |> Option.ofObj with
       | Some src ->
-        el.SetAttribute("src", if src.EndsWith("x") then src.Substring(0, src.Length - 1) else src)
-      | None -> ()
-    )
+        el.SetAttribute(
+          "src",
+          if src.EndsWith("x") then
+            src.Substring(0, src.Length - 1)
+          else
+            src
+        )
+      | None -> ())
 
     task {
-      match! Fs.getOrCreateLockFile (Fs.Paths.GetPerlaConfigPath()) with
+      match! Fs.getOrCreateLockFile (System.IO.Path.GetPerlaConfigPath()) with
       | Ok lock ->
         let map: ImportMap =
           { imports = lock.imports
@@ -108,11 +119,8 @@ module Build =
         let content = doc.ToHtml()
 
         File.WriteAllText($"{outDir}/{indexFile}", content)
-      | Error err ->
-        printfn $"Warn: [{err.Message}]"
-        ()
+      | Error err -> Logger.build ("Failed to get or create lock file", err)
     }
-
 
   let private buildFiles
     (type': ResourceType)
@@ -132,16 +140,17 @@ module Build =
             let tsk = config |> esbuildCssCmd entrypoints
             tsk.ExecuteAsync()
 
-        printfn $"Starting esbuild with pid: [{cmd.ProcessId}]"
+        Logger.build $"Starting esbuild with pid: [{cmd.ProcessId}]"
 
         return! cmd.Task :> Task
       else
-        printfn $"No Entrypoints for {type'.AsString()} found in index.html"
+        Logger.build
+          $"No Entrypoints for {type'.AsString()} found in index.html"
     }
 
   let getExcludes config =
     task {
-      match! Fs.getOrCreateLockFile (Fs.Paths.GetPerlaConfigPath()) with
+      match! Fs.getOrCreateLockFile (System.IO.Path.GetPerlaConfigPath()) with
       | Ok lock ->
         let excludes =
           lock.imports
@@ -158,11 +167,11 @@ module Build =
           |> Option.defaultValue excludes
 
       | Error ex ->
-        printfn $"Warn: [{ex.Message}]"
+        Logger.build ("Failed to get or create lock file", ex)
         return Seq.empty
     }
 
-  let execBuild (config: FdsConfig) =
+  let execBuild (config: PerlaConfig) =
     let buildConfig = defaultArg config.build (BuildConfig.DefaultConfig())
 
     let devServer =
@@ -183,21 +192,18 @@ module Build =
 
     let copyIncludes =
       match buildConfig.copyPaths with
-      | None -> List.empty
-      | Some paths ->
-        paths.includes
-        |> Option.map List.ofSeq
-        |> Option.defaultValue List.empty
+      | None -> Seq.empty
+      | Some paths -> paths.includes |> Option.defaultValue Seq.empty
 
     task {
       match config.fable with
       | Some fable ->
         let cmdResult = (fableCmd (Some false) fable).ExecuteAsync()
 
-        printfn $"Starting Fable with pid: [{cmdResult.ProcessId}]"
+        Logger.build $"Starting Fable with pid: [{cmdResult.ProcessId}]"
 
         do! cmdResult.Task :> Task
-      | None -> printfn "No Fable configuration provided, skipping fable"
+      | None -> Logger.build "No Fable configuration provided, skipping fable"
 
       if not <| File.Exists(esbuildExec) then
         do! setupEsbuild esbuildVersion
@@ -233,35 +239,51 @@ module Build =
         let totalPaths =
           [| for key in map.Keys do
                yield!
-                 Directory.EnumerateFiles(Path.GetFullPath(key), "*.*", opts) |]
-
+                 Directory.EnumerateFiles(Path.GetFullPath(key), "*.*", opts)
+                 |> Seq.map (fun s -> s, s) |]
+        // FIXME: This thing is not funny to use, but at least in the meantime will work
+        // Once the new build pipeline is in, this should disappear
         let includedFiles =
-          totalPaths
-          |> Array.filter (fun path ->
-            copyIncludes
-            |> List.exists (fun ext ->
-              let ext =
-                let ext = ext.Replace('/', Path.DirectorySeparatorChar)
+          [| for (path, target) in totalPaths do
+               for copy in copyIncludes do
+                 let copy, target =
+                   match copy.Split("->") with
+                   | [| origin; target |] -> origin.Trim(), target.Trim()
+                   | [| origin |] -> origin.Trim(), target.Trim()
+                   | _ -> copy.Trim(), copy.Trim()
 
-                if ext.StartsWith "." then
-                  ext.Substring(2)
-                else
-                  ext
+                 let ext =
+                   let copy = copy.Replace('/', Path.DirectorySeparatorChar)
 
-              path.Contains(ext)))
+                   if copy.StartsWith "." then
+                     copy.Substring(2)
+                   else
+                     copy
+
+                 if path.Contains(ext) then
+                   yield path, target |]
 
 
         let excludedFiles =
           totalPaths
-          |> Array.filter (fun path ->
+          |> Array.filter (fun ((path, _)) ->
             copyExcludes
             |> List.exists (fun ext -> path.Contains(ext))
             |> not)
 
         [| yield! excludedFiles
            yield! includedFiles |]
-        |> Array.Parallel.iter (fun path ->
-          let posPath = path.Replace(root, $"{outDir}")
+        |> Array.Parallel.iter (fun (origin, target) ->
+          let target = Path.GetFullPath target
+          let posPath = target.Replace(root, $"{outDir}")
+
+          let print =
+            if origin <> target then
+              $"[blue]{origin}[/] -> [yellow]{target}[/]"
+            else
+              $"[blue]{origin}[/]"
+
+          Logger.log ($"{print} -> [green]{posPath}[/]", escape = false)
 
           try
             Path.GetDirectoryName posPath
@@ -270,7 +292,9 @@ module Build =
           with
           | _ -> ()
 
-          File.Copy(path, posPath))
+          File.Copy(origin, posPath))
+
+      Logger.log $"Copying Files to out directory"
 
       devServer.mountDirectories
       |> Option.map getDirectories
@@ -287,5 +311,7 @@ module Build =
 
             $"./{dirName}/{name}".Replace("\\", "/") ]
 
+      Logger.log "Adding CSS Files to index.html"
       do! insertMapAndCopy cssFiles config
+      Logger.log "Build finished."
     }
