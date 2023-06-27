@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -44,7 +44,7 @@
     <PackageReference Include="FsToolkit.ErrorHandling.TaskResult" Version="2.7.0" />
     <PackageReference Include="FSharp.SystemTextJson" Version="0.17.4" />
     <PackageReference Include="System.Text.Json" Version="6.0.0-rc.2.21480.5" />
-    <PackageReference Include="Yarp.ReverseProxy" Version="1.0.0" />
+    <PackageReference Include="Yarp.ReverseProxy" Version="1.1.2" />
   </ItemGroup>
 
 </Project>
